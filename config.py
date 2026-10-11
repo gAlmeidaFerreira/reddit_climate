@@ -62,9 +62,30 @@ CUTS_CHOSEN_FROM_HISTOGRAM = False     # set True once you have looked at the sc
 # ---------------------------------------------------------------------------------------
 MEAN_CUTS_BY_M = {2: (0.35,), 3: (0.35, 0.65)}     # group mean of raw scores -> m levels (same scale as the cuts)
 MEAN_LABELS_BY_M = {2: ("lean-against", "lean-not-against"), 3: ("lean-against", "centre", "lean-favour")}
-VAR_CUT = 0.125                        # population variance of raw scores: below = consensus, else divided
+VAR_UNBIASED = True                    # True: unbiased sample variance (population variance * n / (n - 1)), the average of
+                                       #   (x_i - x_j)^2 / 2 over pairs; its mean does not depend on the group size n.
+                                       # False: population variance (ddof = 0), which grows with n. Needs MIN_MEMBERS >= 2.
+VAR_CUT = 0.125                        # variance of raw scores: below = consensus, else divided
+                                       #   (largest value: 0.25 if population, 0.5 if unbiased: two scores 0 and 1)
 VAR_CUT_CHOSEN_FROM_HISTOGRAM = False  # PLACEHOLDER value above: set from the histogram of group variances
 VAR_LABELS = ("consensus", "divided")
+
+# ---------------------------------------------------------------------------------------
+# Pair statistics of the composition (alternative to the variance as the "spread" coordinate)
+#   O = share of pairs of members that are OPPOSED (one in the first class, one in the last class)   unbiased in n
+#   M = share of pairs that disagree mildly (different classes, not opposed)
+#   h = 2 * mean_level + opp_level, with opp_level = (O >= OPP_CUT)   -> same 2m categories as g
+# ---------------------------------------------------------------------------------------
+OPP_CUT = None                         # None: matched to VAR_CUT, i.e. the cut of O that labels the same share of events
+                                       #   "high" as VAR_CUT does for the variance (a fair comparison); or a number in (0, 1]
+OPP_LABELS = ("low-opposition", "high-opposition")
+DISAGREE_WEIGHTS = (0.0, 0.25, 0.5, 1.0)   # D(w) = O + w * M : weight of a mild pair relative to an opposed pair.
+                                       #   0 = opposed pairs only ; 0.25 = variance of the class positions ;
+                                       #   0.5 = mean absolute distance ; 1 = every disagreeing pair counts the same
+TEST_SIZE_EDGES = (3, 4, 6)            # group-size classes of the comparison test: 2 | 3 | 4-5 | 6+
+COMPARE_FOLDS = 5                      # user folds of the held-out comparison
+COMPARE_TAUS = (0, 10, 25, 50, 100, 200, 500)   # tau chosen inside the training folds (nested), per summary
+COMPARE_B = 500                        # user bootstrap for the paired differences
 
 # ---------------------------------------------------------------------------------------
 # Group influencer c = composition of the group (how many members in each class)
@@ -118,14 +139,15 @@ SLICE_PAIR_SUBREDDITS = ("r/2",)
 # Events table: the interface between events.py and tensors.py
 # ---------------------------------------------------------------------------------------
 COL_S, COL_L, COL_G, COL_C, COL_K = "s", "l", "g", "c", "k"
+COL_H, COL_LEAN = "h", "lean"          # h: mean level x opposed-pair level ; lean: mean level of the group alone
 EVENT_COLS = ("user", "thread", "subreddit", "t_reply", "gap", "parent_kind",
-              COL_S, COL_L, COL_G, COL_C, COL_K, "n_members", "mu", "var")
+              COL_S, COL_L, COL_G, COL_C, COL_H, COL_LEAN, COL_K, "n_members", "mu", "var", "opp", "mild")
 
 
 def set_classes(m):
     """Select the number of opinion classes (2 or 3) and recompute every derived constant.
     Call it before building events; tensors.py and events.py read these values at call time."""
-    global N_CLASSES, CLASS_LABELS, CUTS, MEAN_CUTS, MEAN_LABELS, G_LABELS, N_G
+    global N_CLASSES, CLASS_LABELS, CUTS, MEAN_CUTS, MEAN_LABELS, G_LABELS, N_G, H_LABELS, N_H
     if m not in CUTS_BY_M:
         raise ValueError(f"N_CLASSES must be one of {sorted(CUTS_BY_M)}, got {m}")
     N_CLASSES = m
@@ -135,6 +157,8 @@ def set_classes(m):
     MEAN_LABELS = MEAN_LABELS_BY_M[m]
     G_LABELS = tuple(f"{a}-{b}" for a in MEAN_LABELS for b in VAR_LABELS)    # index g = 2 * mean_level + var_level
     N_G = len(G_LABELS)
+    H_LABELS = tuple(f"{a}-{b}" for a in MEAN_LABELS for b in OPP_LABELS)           # index h = 2 * mean_level + opp_level
+    N_H = len(H_LABELS)
 
 
 def validate():
@@ -146,8 +170,12 @@ def validate():
             raise ValueError(f"{name} must be {N_CLASSES - 1} increasing values in [0, 1], got {cuts}")
     if len(CLASS_LABELS) != N_CLASSES or len(MEAN_LABELS) != N_CLASSES:
         raise ValueError("CLASS_LABELS and MEAN_LABELS need one label per class")
-    if not 0 < VAR_CUT < 0.25:
-        raise ValueError(f"VAR_CUT must lie in (0, 0.25) (the raw variance cannot exceed 0.25), got {VAR_CUT}")
+    var_max = 0.5 if VAR_UNBIASED else 0.25
+    if not 0 < VAR_CUT < var_max:
+        raise ValueError(f"VAR_CUT must lie in (0, {var_max}) for VAR_UNBIASED = {VAR_UNBIASED} "
+                         f"(the largest possible variance), got {VAR_CUT}")
+    if VAR_UNBIASED and MIN_MEMBERS < 2:
+        raise ValueError("VAR_UNBIASED needs MIN_MEMBERS >= 2 (the unbiased variance of one score is undefined)")
     if MIN_MEMBERS < 1 or (M_MAX is not None and M_MAX < MIN_MEMBERS):
         raise ValueError("MIN_MEMBERS must be >= 1 and M_MAX (if set) >= MIN_MEMBERS")
     if TAU < 0 or TAU_SLICE < 0 or B < 1 or N_PERM < 1:
@@ -158,6 +186,16 @@ def validate():
         raise ValueError("MAX_GAP_DAYS must be positive or None")
     if len(G_LABELS) != N_G or len(set(G_LABELS)) != N_G or N_G != 2 * N_CLASSES:
         raise ValueError("G_LABELS must contain 2 * N_CLASSES distinct categories")
+    if OPP_CUT is not None and not 0 < OPP_CUT <= 1:
+        raise ValueError(f"OPP_CUT must be None or lie in (0, 1], got {OPP_CUT}")
+    if not DISAGREE_WEIGHTS or any(w < 0 for w in DISAGREE_WEIGHTS):
+        raise ValueError("DISAGREE_WEIGHTS must be a non-empty tuple of non-negative numbers")
+    if len(OPP_LABELS) != 2 or N_H != 2 * N_CLASSES:
+        raise ValueError("OPP_LABELS needs two labels")
+    if any(b <= a for a, b in zip(TEST_SIZE_EDGES, TEST_SIZE_EDGES[1:])) or any(e <= MIN_MEMBERS for e in TEST_SIZE_EDGES):
+        raise ValueError("TEST_SIZE_EDGES must be increasing and larger than MIN_MEMBERS")
+    if COMPARE_FOLDS < 2 or COMPARE_B < 1 or not COMPARE_TAUS:
+        raise ValueError("COMPARE_FOLDS >= 2, COMPARE_B >= 1 and a non-empty COMPARE_TAUS are needed")
     if COMP_MODE not in ("counts", "shares"):
         raise ValueError(f"COMP_MODE must be 'counts' or 'shares', got {COMP_MODE!r}")
     if COMP_MAX_SIZE < max(MIN_MEMBERS, 1) or COMP_GRID < 1:

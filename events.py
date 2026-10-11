@@ -25,6 +25,7 @@ Usage:
 
     python events.py                       # runs the brute-force self-test on synthetic data
 """
+import json
 import re
 import warnings
 
@@ -230,13 +231,36 @@ def _group_slow(rep):
     return pd.DataFrame.from_dict(out, orient="index", columns=["g_n", "g_mu", "g_var"] + count_cols())
 
 
+def _pair_stats(counts):
+    """Class counts of groups (N x m) -> (O, M), both unbiased in the group size n:
+    O = share of pairs of members that are opposed (one in the first class, one in the last class) = c_0 * c_{m-1} / C(n, 2)
+    M = share of pairs that disagree mildly (different classes, not opposed).
+    NaN for groups with fewer than 2 members. For m = 2 every disagreement is 'opposed' and M = 0."""
+    c = np.asarray(counts, dtype=float)
+    n = c.sum(axis=1)
+    pairs = n * (n - 1) / 2
+    same = (c * (c - 1) / 2).sum(axis=1)
+    opposed = c[:, 0] * c[:, -1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (np.where(pairs > 0, opposed / pairs, np.nan),
+                np.where(pairs > 0, (pairs - same - opposed) / pairs, np.nan))
+
+
 def add_group_stats(rep):
-    """Adds g_n (scored members), g_mu, g_var (population variance, raw scores) and the class counts g_c*."""
+    """Adds g_n (scored members), g_mu, g_var and the class counts g_c*, all from raw scores.
+    g_var is the unbiased sample variance if cfg.VAR_UNBIASED (default), else the population variance;
+    g_var_pop is always the population variance. g_opp and g_mild are the shares of opposed and of mildly
+    disagreeing pairs of members (see _pair_stats)."""
     slow = cfg.AUTHORS_ONCE or cfg.M_MAX is not None
     stats = (_group_slow if slow else _group_fast)(rep)
     rep = rep.drop(columns=[c for c in stats.columns if c in rep.columns]).join(stats)
+    rep["g_var_pop"] = rep["g_var"]                                # population variance (ddof = 0), kept for reference
+    if cfg.VAR_UNBIASED:                                           # sample variance: times n / (n - 1), undefined for n < 2
+        n = rep["g_n"].where(rep["g_n"] >= 2)
+        rep["g_var"] = rep["g_var_pop"] * n / (n - 1)
     for c in ["g_n"] + count_cols():
         rep[c] = rep[c].fillna(0)
+    rep["g_opp"], rep["g_mild"] = _pair_stats(rep[count_cols()].to_numpy())
     return rep
 
 
@@ -349,7 +373,7 @@ def _format(d, **cols):
                        cfg.COL_S: d[cfg.COL_S], cfg.COL_K: d[cfg.COL_K]})
     for name, value in cols.items():
         ev[name] = value
-    for c in (cfg.COL_S, cfg.COL_L, cfg.COL_G, cfg.COL_C, cfg.COL_K, "n_members"):
+    for c in (cfg.COL_S, cfg.COL_L, cfg.COL_G, cfg.COL_C, cfg.COL_H, cfg.COL_LEAN, cfg.COL_K, "n_members"):
         ev[c] = ev[c].astype("Int64") if c in ev else pd.array([pd.NA] * len(ev), dtype="Int64")
     return ev.reindex(columns=list(cfg.EVENT_COLS))
 
@@ -362,28 +386,55 @@ def dyadic_events(d, steps):
                          "mu": d["x_parent"], "var": 0.0})
 
 
-def _g_category(d):
-    """g = 2 * mean_level + var_level from the raw mean and variance."""
-    return 2 * to_class(d["g_mu"], cfg.MEAN_CUTS) + (d["g_var"] >= cfg.VAR_CUT).astype(float)
+def matched_cut(values, target):
+    """Cut such that the share of values >= cut is as close as possible to `target` (values with ties
+    cannot hit it exactly). Only positive values are candidate cuts; returns 1.0 + 1e-9 if nothing is positive."""
+    v = np.sort(np.asarray(values, dtype=float))
+    v = v[~np.isnan(v)]
+    vals = np.unique(v[v > 0])
+    if len(vals) == 0:
+        return float(np.inf)
+    share = 1.0 - np.searchsorted(v, vals, side="left") / len(v)             # share of values >= each candidate
+    return float(vals[np.argmin(np.abs(share - target))])
 
 
-def group_events(d, steps):
-    """Reply with >= MIN_MEMBERS scored members before it: s, g, k with g = 2 * mean_level + var_level."""
+def opp_cut_for(d):
+    """Cut of the opposed-pair share O: cfg.OPP_CUT if given, otherwise the value whose share of 'high' groups
+    is closest to the share of groups with variance >= VAR_CUT (so that g and h split the events in the same proportion)."""
+    if cfg.OPP_CUT is not None:
+        return float(cfg.OPP_CUT)
+    d = d[d["g_n"] >= cfg.MIN_MEMBERS]
+    cut = matched_cut(d["g_opp"], float((d["g_var"] >= cfg.VAR_CUT).mean()))
+    return 1.0 if np.isinf(cut) else cut
+
+
+def _group_cols(d, opp_cut):
+    """Columns shared by the group and composition events: g (mean x variance), h (mean x opposed pairs), lean."""
+    lean = to_class(d["g_mu"], cfg.MEAN_CUTS)
+    return {cfg.COL_G: 2 * lean + (d["g_var"] >= cfg.VAR_CUT).astype(float),
+            cfg.COL_H: 2 * lean + (d["g_opp"] >= opp_cut).astype(float),
+            cfg.COL_LEAN: lean, "opp": d["g_opp"], "mild": d["g_mild"], "n_members": d["g_n"], "mu": d["g_mu"], "var": d["g_var"]}
+
+
+def group_events(d, steps, opp_cut=None):
+    """Reply with >= MIN_MEMBERS scored members before it: s, g, h, k.
+    g = 2 * mean_level + var_level ; h = 2 * mean_level + opp_level."""
     d = _step(steps, f"group has >= {cfg.MIN_MEMBERS} scored members  ->  group events", d[d["g_n"] >= cfg.MIN_MEMBERS])
-    return _format(d, **{cfg.COL_G: _g_category(d), "n_members": d["g_n"], "mu": d["g_mu"], "var": d["g_var"]})
+    opp_cut = opp_cut_for(d) if opp_cut is None else opp_cut
+    return _format(d, **_group_cols(d, opp_cut))
 
 
-def composition_events(d, steps):
-    """Same replies as group events (optionally capped in size) with the composition cell c next to g."""
+def composition_events(d, steps, opp_cut=None):
+    """Same replies as group events (optionally capped in size) with the composition cell c next to g and h."""
     d = _step(steps, f"group has >= {cfg.MIN_MEMBERS} scored members", d[d["g_n"] >= cfg.MIN_MEMBERS])
+    opp_cut = opp_cut_for(d) if opp_cut is None else opp_cut
     if cfg.COMP_MODE == "counts":
         d = _step(steps, f"group has at most {cfg.COMP_MAX_SIZE} members  ->  composition events",
                   d[d["g_n"] <= cfg.COMP_MAX_SIZE])
     else:
         steps.append(("composition events (shares: no size cap)", len(d)))
     cell = assign_cells(d[count_cols()].to_numpy())
-    return _format(d, **{cfg.COL_C: cell, cfg.COL_G: _g_category(d), "n_members": d["g_n"],
-                         "mu": d["g_mu"], "var": d["g_var"]})
+    return _format(d, **{cfg.COL_C: cell, **_group_cols(d, opp_cut)})
 
 
 def prepare(threads=None, submissions=None):
@@ -400,11 +451,15 @@ def build_events(threads=None, submissions=None, verbose=True):
     """Whole pipeline. Returns dict with dyadic, group, comp, funnel_dyadic, funnel_group, funnel_comp, replies, items."""
     items, rep, common, steps = prepare(threads, submissions)
     steps_d, steps_g, steps_c = list(steps), list(steps), list(steps)
-    res = {"items": items, "replies": rep,
-           "dyadic": dyadic_events(common, steps_d), "group": group_events(common, steps_g),
-           "comp": composition_events(common, steps_c)}
+    opp_cut = opp_cut_for(common)                      # one cut for every table, from the same events as VAR_CUT
+    res = {"items": items, "replies": rep, "opp_cut": opp_cut,
+           "dyadic": dyadic_events(common, steps_d), "group": group_events(common, steps_g, opp_cut),
+           "comp": composition_events(common, steps_c, opp_cut)}
     res.update(funnel_dyadic=funnel(steps_d), funnel_group=funnel(steps_g), funnel_comp=funnel(steps_c))
     if verbose:
+        g = res["group"]
+        print(f"OPP_CUT used: {opp_cut:.3f} ({'given' if cfg.OPP_CUT is not None else 'matched to VAR_CUT'}) | share of group events "
+              f"with high variance {(g['var'] >= cfg.VAR_CUT).mean():.3f}, with high opposition {(g['opp'] >= opp_cut).mean():.3f}")
         for name in ("funnel_dyadic", "funnel_group", "funnel_comp"):
             print(f"\n=== {name} ===\n{res[name].to_string(index=False)}")
     return res
@@ -417,6 +472,7 @@ def save_events(res, folder=None):
     for name in ("dyadic", "group", "comp"):
         res[name].to_parquet(folder / f"events_{name}.parquet")
         res["funnel_" + name].to_csv(folder / f"funnel_{name}.csv", index=False)
+    (folder / "opp_cut.json").write_text(json.dumps({"opp_cut": res.get("opp_cut")}))
     composition_cells().assign(parts=lambda r: r["parts"].astype(str)).to_csv(folder / "composition_cells.csv", index=False)
     cfg.save(folder / "config_used.json")
 
@@ -430,10 +486,14 @@ def influencer_info(col):
         return cfg.N_CLASSES, list(cfg.CLASS_LABELS)
     if col == cfg.COL_G:
         return cfg.N_G, list(cfg.G_LABELS)
+    if col == cfg.COL_H:
+        return cfg.N_H, list(cfg.H_LABELS)
+    if col == cfg.COL_LEAN:
+        return cfg.N_CLASSES, list(cfg.MEAN_LABELS)
     if col == cfg.COL_C:
         reg = composition_cells()
         return len(reg), reg["label"].tolist()
-    raise ValueError(f"influencer column must be one of {cfg.COL_L!r}, {cfg.COL_G!r}, {cfg.COL_C!r}; got {col!r}")
+    raise ValueError(f"influencer column must be one of l, g, h, lean, c; got {col!r}")
 
 
 def _fill_counts(ev, col):
@@ -486,7 +546,9 @@ def compare_fill(res, thresholds=(10, 30, 100)):
     """Fill of the three summaries side by side: parent class (l), mean x variance (g), composition (c).
     'g (comp events)' is g on the same replies as c, the fair comparison with c."""
     parts = [("l  parent class", res["dyadic"], cfg.COL_L), ("g  mean x variance", res["group"], cfg.COL_G),
-             ("g  (comp events)", res["comp"], cfg.COL_G), ("c  composition", res["comp"], cfg.COL_C)]
+             ("h  mean x opposed pairs", res["group"], cfg.COL_H),
+             ("g  (comp events)", res["comp"], cfg.COL_G), ("h  (comp events)", res["comp"], cfg.COL_H),
+             ("c  composition", res["comp"], cfg.COL_C)]
     out = pd.concat([fill_summary(ev, col, thresholds).assign(summary=name) for name, ev, col in parts], ignore_index=True)
     return out.set_index("summary")
 
@@ -594,6 +656,7 @@ def _selftest_one(verbose=True):
     raw_c = threads.assign(t=pd.to_datetime(threads[cfg.RAW_TIME]), x=pd.to_numeric(threads[cfg.RAW_SCORE], errors="coerce"))
     raw_s = submissions.assign(t=pd.to_datetime(submissions[cfg.RAW_TIME]), x=pd.to_numeric(submissions[cfg.RAW_SCORE], errors="coerce"))
     n_checked = n_with_members = 0
+    brute_pairs = {}
     for _, r in rep[rep["x"].notna() & rep["user"].notna()].iterrows():
         c = raw_c[(raw_c[cfg.RAW_COMMENT_ID] == r["item_id"]) & (raw_c[cfg.RAW_SUBREDDIT_ID] == r["subreddit"])].iloc[0]
         xs = []
@@ -613,6 +676,11 @@ def _selftest_one(verbose=True):
         if xs:
             n_with_members += 1
             assert np.isclose(got["g_mu"], np.mean(xs)) and np.isclose(got["g_var"], np.var(xs))
+        cl = [_brute_class(v) for v in xs]                          # opposed / mild pairs by double loop
+        npair = len(cl) * (len(cl) - 1) / 2
+        n_opp = sum(1 for a in range(len(cl)) for b in range(a + 1, len(cl)) if abs(cl[a] - cl[b]) == cfg.N_CLASSES - 1)
+        n_mild = sum(1 for a in range(len(cl)) for b in range(a + 1, len(cl)) if 0 < abs(cl[a] - cl[b]) < cfg.N_CLASSES - 1)
+        brute_pairs[r.name] = (n_opp / npair, n_mild / npair) if npair else (np.nan, np.nan)
         brute = [sum(_brute_class(v) == j for v in xs) for j in range(cfg.N_CLASSES)]
         assert [int(got[c]) for c in count_cols()] == brute, f"{r['item_id']}: class counts {got[count_cols()].tolist()} vs {brute}"
         # own opinion: the time of the last scored item of the user strictly before the parent
@@ -626,6 +694,33 @@ def _selftest_one(verbose=True):
             else:
                 assert pd.isna(rep.loc[r.name, "t_prev"]), f"{r['item_id']}: own opinion should be missing"
         n_checked += 1
+
+    # opposed / mild pair shares against the double loop, and the matched cut
+    rp = add_group_stats(rep.drop(columns=[c for c in rep.columns if c.startswith("g_")], errors="ignore"))
+    bp = pd.DataFrame.from_dict(brute_pairs, orient="index", columns=["O", "M"])
+    assert np.allclose(rp.loc[bp.index, "g_opp"], bp["O"], equal_nan=True) and np.allclose(rp.loc[bp.index, "g_mild"], bp["M"], equal_nan=True)
+    elig = rp[rp["g_n"] >= cfg.MIN_MEMBERS]
+    cut = opp_cut_for(elig)
+    target, got_share = (elig["g_var"] >= cfg.VAR_CUT).mean(), (elig["g_opp"] >= cut).mean()
+    vals = np.unique(elig["g_opp"].dropna()[elig["g_opp"].dropna() > 0])
+    best = min(abs((elig["g_opp"] >= v).mean() - target) for v in vals)
+    assert abs(abs(got_share - target) - best) < 1e-12, "matched OPP_CUT is not the closest achievable share"
+
+    # variance option: unbiased = population * n / (n - 1), checked against numpy's ddof on the raw members
+    old_u = cfg.VAR_UNBIASED
+    try:
+        for flag in (True, False):
+            cfg.VAR_UNBIASED = flag
+            r2 = add_group_stats(rep.drop(columns=[c for c in rep.columns if c.startswith("g_")], errors="ignore"))
+            ok = r2["g_n"] >= 2
+            assert np.allclose(r2.loc[ok, "g_var_pop"] * (r2.loc[ok, "g_n"] / (r2.loc[ok, "g_n"] - 1) if flag else 1.0),
+                               r2.loc[ok, "g_var"], atol=1e-12)
+            assert r2.loc[~ok, "g_var"].isna().all() or not flag
+            if flag:                                               # two members: (a - b)^2 / 2
+                two = r2[r2["g_n"] == 2]
+                assert (two["g_var"] <= 0.5 + 1e-12).all() and (two["g_var"] >= 0).all()
+    finally:
+        cfg.VAR_UNBIASED = old_u
 
     # the full pipeline runs, and the options that force the slow path run too
     res = build_events(threads, submissions, verbose=False)
@@ -689,6 +784,14 @@ def selftest(verbose=True):
     """Run the whole self-test for m = 2 and m = 3 and restore the configuration."""
     old = cfg.N_CLASSES
     try:
+        # O is unbiased in the group size: E[O] = 2 * a * f for every n (m = 3, class shares a, 1 - a - f, f)
+        rng = np.random.default_rng(5)
+        p = np.array([0.5, 0.27, 0.23])
+        for n in (2, 3, 5, 12):
+            counts = rng.multinomial(n, p, size=200000)
+            O, M = _pair_stats(counts)
+            assert abs(O.mean() - 2 * p[0] * p[2]) < 0.004, (n, O.mean())
+            assert abs(M.mean() - 2 * p[1] * (p[0] + p[2])) < 0.004, (n, M.mean())
         for m in (3, 2):
             cfg.set_classes(m)
             _selftest_one(verbose)

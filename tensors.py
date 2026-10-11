@@ -37,27 +37,45 @@ EPS = 1e-9          # the number of classes m is read from cfg.N_CLASSES at call
 # =======================================================================================
 # Counting
 # =======================================================================================
+_EXTRA = {}          # derived influencer columns registered by compare_summaries: name -> (n, labels, lean array)
+
+
+def register_influencer(name, n, labels, lean_of=None):
+    """Make a derived column usable as an influencer in every function of this module."""
+    _EXTRA[name] = (int(n), list(labels), lean_of)
+
+
 def n_influencer(infl):
     """Number of influencer categories for the column `infl`."""
+    if infl in _EXTRA:
+        return _EXTRA[infl][0]
     if infl == cfg.COL_L:
         return cfg.N_CLASSES
-    if infl == cfg.COL_G:
+    if infl in (cfg.COL_G, cfg.COL_H):
         return cfg.N_G
+    if infl == cfg.COL_LEAN:
+        return cfg.N_CLASSES
     if infl == cfg.COL_C:
         return len(events.composition_cells())
-    raise ValueError(f"influencer column must be '{cfg.COL_L}', '{cfg.COL_G}' or '{cfg.COL_C}', got {infl!r}")
+    raise ValueError(f"influencer column must be one of l, g, h, lean, c or a registered column, got {infl!r}")
 
 
 def influencer_labels(infl):
+    if infl in _EXTRA:
+        return _EXTRA[infl][1]
     return events.influencer_info(infl)[1]
 
 
 def lean(infl):
     """Class towards which each influencer category points: l itself; g: its mean level; c: the rounded
     mean class position of the composition. Used for the 'toward' column."""
-    if infl == cfg.COL_L:
+    if infl in _EXTRA:
+        if _EXTRA[infl][2] is None:
+            raise ValueError(f"no lean registered for {infl!r}")
+        return np.asarray(_EXTRA[infl][2])
+    if infl in (cfg.COL_L, cfg.COL_LEAN):
         return np.arange(cfg.N_CLASSES)
-    if infl == cfg.COL_G:
+    if infl in (cfg.COL_G, cfg.COL_H):
         return np.arange(cfg.N_G) // 2
     parts = np.array(events.composition_cells()["parts"].tolist(), dtype=float)
     pos = (parts * np.arange(cfg.N_CLASSES)).sum(1) / parts.sum(1)
@@ -311,6 +329,164 @@ def choose_tau(ev, infl, taus=(0, 5, 10, 25, 50, 100, 200, 500), n_folds=5, seed
 
 
 # =======================================================================================
+# Which summary of the group captures the influence on the individual? (held-out comparison)
+# =======================================================================================
+def _size_bin(n_members):
+    return np.searchsorted(np.array(cfg.TEST_SIZE_EDGES), np.asarray(n_members), side="right")
+
+
+def _dname(w):
+    return f"D({w:g})"
+
+
+def _derived_table(ev):
+    """Events with every summary that will be compared, on the SAME events, as integer columns.
+    none (1 category), size (group-size class), lean (mean level), lean_size, g (mean x variance),
+    h (mean x opposed pairs), gh (mean x variance x opposed pairs) and c (composition, when present)."""
+    m, nb = cfg.N_CLASSES, len(cfg.TEST_SIZE_EDGES) + 1
+    need = [cfg.COL_S, cfg.COL_K, cfg.COL_G, cfg.COL_H, cfg.COL_LEAN, "n_members", "opp", "mild", "var", "user"]
+    d = ev.dropna(subset=need).copy()
+    for c in need[:-4]:
+        d[c] = d[c].astype(int)
+    target = float((d["var"] >= cfg.VAR_CUT).mean())               # every 'high' label keeps this share of the events
+    d["mlev"] = (d["mild"] >= events.matched_cut(d["mild"], target)).astype(int)
+    for w in cfg.DISAGREE_WEIGHTS:
+        D = d["opp"] + w * d["mild"]
+        d[_dname(w)] = 2 * d[cfg.COL_LEAN] + (D >= events.matched_cut(D, target)).astype(int)
+    d["none"] = 0
+    d["size"] = _size_bin(d["n_members"])
+    d["vlev"] = d[cfg.COL_G] % 2
+    d["olev"] = d[cfg.COL_H] % 2
+    d["lean_size"] = d[cfg.COL_LEAN] * nb + d["size"]
+    d["gh"] = d[cfg.COL_G] * 2 + d["olev"]
+    lean = np.arange(m)
+    spec = {"none": (1, ["no group information"], [0]),
+            "size": (nb, [f"size class {i}" for i in range(nb)], [0] * nb),
+            cfg.COL_LEAN: (m, list(cfg.MEAN_LABELS), lean),
+            "lean_size": (m * nb, [f"{a} | size {i}" for a in cfg.MEAN_LABELS for i in range(nb)], np.repeat(lean, nb)),
+            cfg.COL_G: (cfg.N_G, list(cfg.G_LABELS), np.arange(cfg.N_G) // 2),
+            cfg.COL_H: (cfg.N_G, list(cfg.H_LABELS), np.arange(cfg.N_G) // 2),
+            "gh": (4 * m, [f"{g} + {o}" for g in cfg.G_LABELS for o in cfg.OPP_LABELS], np.arange(4 * m) // 4),
+            "vlev": (2, list(cfg.VAR_LABELS), [0, 0]), "olev": (2, list(cfg.OPP_LABELS), [0, 0]),
+            "mlev": (2, ["low-mild", "high-mild"], [0, 0])}
+    for w in cfg.DISAGREE_WEIGHTS:
+        spec[_dname(w)] = (cfg.N_G, [f"{a}-{b}" for a in cfg.MEAN_LABELS for b in ("low", "high")], np.arange(cfg.N_G) // 2)
+    if cfg.COL_C in d and d[cfg.COL_C].notna().all() and len(d):
+        d[cfg.COL_C] = d[cfg.COL_C].astype(int)
+        reg = events.composition_cells()
+        spec[cfg.COL_C] = (len(reg), reg["label"].tolist(), lean_c())
+    _EXTRA.clear()                                                  # sizes depend on m; built-in columns resolve themselves
+    builtin = (cfg.COL_G, cfg.COL_H, cfg.COL_LEAN, cfg.COL_C)
+    for name, (n, labels, ln) in spec.items():
+        if name not in builtin:
+            register_influencer(name, n, labels, ln)
+    return d, [k for k in spec if k not in ("vlev", "olev", "mlev")]
+
+
+def lean_c():
+    parts = np.array(events.composition_cells()["parts"].tolist(), dtype=float)
+    return np.floor(np.round((parts * np.arange(cfg.N_CLASSES)).sum(1) / parts.sum(1), 6) + 0.5).astype(int)
+
+
+def _heldout_loss(d, infl, taus, n_folds, seed):
+    """Per-event log-loss (bits) of tensor p[s, i, k] fitted on the other user folds. tau is chosen inside
+    the training folds (inner user folds), so the choice never sees the held-out events. The folds are the
+    same for every summary, which makes the losses of two summaries paired."""
+    s, i, k = (d[c].to_numpy(dtype=int) for c in (cfg.COL_S, infl, cfg.COL_K))
+    n_i, m = n_influencer(infl), cfg.N_CLASSES
+    code = s * (n_i * m) + i * m + k
+    users = pd.factorize(d["user"])[0]
+    nu = users.max() + 1
+    outer = np.random.default_rng(seed).integers(0, n_folds, nu)[users]
+
+    def counts(mask):
+        return np.bincount(code[mask], minlength=m * n_i * m).reshape(m, n_i, m).astype(float)
+
+    def loss_of(P, idx):
+        p = P[s[idx], i[idx], k[idx]]
+        return -np.log2(np.clip(np.nan_to_num(p, nan=0.0), EPS, 1))
+
+    loss, chosen = np.empty(len(d)), []
+    for f in range(n_folds):
+        train, test = outer != f, outer == f
+        inner = np.random.default_rng(seed + 1 + f).integers(0, n_folds, nu)[users]
+        total = dict.fromkeys(taus, 0.0)
+        for g in range(n_folds):
+            N = counts(train & (inner != g))
+            val = np.flatnonzero(train & (inner == g))
+            for t in taus:
+                total[t] += loss_of(probabilities(N, t), val).sum()
+        best = min(total, key=total.get)
+        chosen.append(best)
+        loss[test] = loss_of(probabilities(counts(train), best), np.flatnonzero(test))
+    return loss, chosen
+
+
+def _paired(diff, users, B, seed):
+    """Mean of per-event differences with a user-cluster bootstrap interval."""
+    u = pd.factorize(users)[0]
+    sums, cnt = np.bincount(u, weights=diff), np.bincount(u).astype(float)
+    rng = np.random.default_rng(seed)
+    n = len(sums)
+    boots = np.empty(B)
+    for b in range(B):
+        w = np.bincount(rng.integers(0, n, n), minlength=n)
+        boots[b] = (w * sums).sum() / (w * cnt).sum()
+    lo, hi = np.percentile(boots, cfg.CI)
+    return float(sums.sum() / cnt.sum()), float(lo), float(hi)
+
+
+def compare_summaries(ev, ref=None, n_perm=None, seed=None, tests=True):
+    """Which summary of the group tells most about the replier's new opinion k?
+    Works on events that carry g, h, lean and n_members (the group or composition table), restricted to the
+    rows where every summary exists, so all of them are scored on exactly the same events.
+    table: held-out log-loss (bits per event, user folds, tau chosen inside the training folds), the gain
+           over 'none' and the paired difference to the reference summary `ref` (default g) with a user-bootstrap
+           interval; positive 'better_than_ref' means lower loss than the reference.
+    added: does the second coordinate add information beyond the other one? Permutation test of
+           I(K; coordinate | s, lean, size [, other coordinate]) with the shuffle inside those strata;
+           cmi_excess = observed - mean of the null (bits per event).
+    family: D(w) = O + w * M for the weights of cfg.DISAGREE_WEIGHTS (lean level x high/low level of D(w), the cut
+           matched to the same share of 'high' events as VAR_CUT): is it worth counting mild disagreement,
+           and with which weight? better_than_w0 > 0 means that adding the mild pairs lowers the loss."""
+    seed = cfg.SEED if seed is None else seed
+    ref = cfg.COL_G if ref is None else ref
+    d, names = _derived_table(ev)
+    if len(d) == 0:
+        raise ValueError("no event has all the columns needed for the comparison")
+    losses, taus = {}, {}
+    for name in names:
+        losses[name], taus[name] = _heldout_loss(d, name, cfg.COMPARE_TAUS, cfg.COMPARE_FOLDS, seed)
+    base, rows = losses["none"], []
+    for name in names:
+        diff = losses[ref] - losses[name]
+        mean, lo, hi = _paired(diff, d["user"].to_numpy(), cfg.COMPARE_B, seed)
+        rows.append({"summary": name, "categories": n_influencer(name), "logloss_bits": losses[name].mean(),
+                     "gain_vs_none": base.mean() - losses[name].mean(), "median_tau": float(np.median(taus[name])),
+                     "better_than_ref": mean, "ref_lo": lo, "ref_hi": hi})
+    table = pd.DataFrame(rows).set_index("summary")
+    fam = table.loc[[_dname(w) for w in cfg.DISAGREE_WEIGHTS], ["logloss_bits", "gain_vs_none", "better_than_ref", "ref_lo", "ref_hi"]].copy()
+    fam.index = pd.Index(list(cfg.DISAGREE_WEIGHTS), name="w (weight of a mild pair)")
+    fam["better_than_w0"] = fam["logloss_bits"].iloc[0] - fam["logloss_bits"]
+    out = {"table": table, "family": fam, "n_events": len(d), "n_users": d["user"].nunique(), "ref": ref, "losses": losses}
+    if tests:
+        base_strata = (cfg.COL_S, cfg.COL_LEAN, "size")
+        spec = [("opposed pairs | s, lean, size", "olev", base_strata),
+                ("variance      | s, lean, size", "vlev", base_strata),
+                ("opposed pairs | s, lean, size, variance", "olev", base_strata + ("vlev",)),
+                ("variance      | s, lean, size, opposed pairs", "vlev", base_strata + ("olev",)),
+                ("mild pairs    | s, lean, size, opposed pairs", "mlev", base_strata + ("olev",)),
+                ("opposed pairs | s, lean, size, mild pairs", "olev", base_strata + ("mlev",))]
+        rows = []
+        for label, col, strata in spec:
+            r = permutation_test(d, col, strata, n_perm, seed)
+            rows.append({"coordinate | held fixed": label, "cmi_bits": r["cmi"], "null_mean": float(r["null"].mean()),
+                         "cmi_excess": r["cmi_excess"], "p_value": r["p_value"]})
+        out["added"] = pd.DataFrame(rows).set_index("coordinate | held fixed")
+    return out
+
+
+# =======================================================================================
 # Everything for one tensor
 # =======================================================================================
 def fit_tensor(ev, infl, B=None, n_perm=None, tau=None, seed=None):
@@ -356,6 +532,54 @@ def _synthetic_events(n=30000, n_users=600, dependent=True, seed=3, with_comp=Fa
     for col in (cfg.COL_S, cfg.COL_L, cfg.COL_G, cfg.COL_C, cfg.COL_K):
         ev[col] = ev[col].astype("Int64")
     return ev, P_true
+
+
+def _synthetic_groups(rule, n=40000, n_users=800, seed=11):
+    """Events whose groups are built from raw scores, so that variance and opposed pairs are both computed the
+    way events.py computes them. The new class k depends on s and the lean in both rules; in addition
+        rule = 'opposed' : a group with many opposed pairs pushes k to the neutral class
+        rule = 'variance': a group with high variance pushes k to the neutral class (opposed pairs play no role)
+        rule = 'mild'    : a group with many mildly disagreeing pairs pushes k to the neutral class"""
+    rng = np.random.default_rng(seed)
+    m = cfg.N_CLASSES
+    cuts = list(cfg.CUTS)
+    edges = [0.0] + cuts + [1.0]
+    size = rng.choice([2, 3, 4, 5, 6, 8], n)
+    kind = rng.random(n)
+    rows = []
+    for a in range(n):
+        if kind[a] < 0.3:                                          # two camps (plus a few neutrals)
+            cls = rng.choice([0, m - 1] + ([1] if m == 3 else []), size[a], p=[.45, .45, .1] if m == 3 else [.5, .5])
+        else:                                                      # ordinary group
+            cls = rng.choice(m, size[a], p=[.5, .27, .23] if m == 3 else [.5, .5])
+        x = rng.uniform(np.take(edges[:-1], cls), np.take(edges[1:], cls))
+        rows.append((len(x), x.mean(), x.var(ddof=1) if len(x) > 1 else np.nan, np.bincount(cls, minlength=m)))
+    g_n = np.array([r[0] for r in rows])
+    d = pd.DataFrame({"g_n": g_n, "g_mu": [r[1] for r in rows], "g_var": [r[2] for r in rows]})
+    d["g_opp"], d["g_mild"] = events._pair_stats(np.array([r[3] for r in rows]))
+    cut = events.opp_cut_for(d)
+    ev = events._format(
+        pd.DataFrame({"thread": rng.integers(0, 4000, n), "subreddit": "r/2", "user": rng.integers(0, n_users, n),
+                      "t_reply": pd.Timestamp("2021-06-01"), "gap": 1.0, "parent_kind": "comment",
+                      cfg.COL_S: rng.integers(0, m, n), cfg.COL_K: 0}),
+        **events._group_cols(d, cut))
+    s, lean = ev[cfg.COL_S].to_numpy(int), ev[cfg.COL_LEAN].to_numpy(int)
+    if rule == "opposed":
+        trigger = ev[cfg.COL_H].to_numpy(int) % 2
+    elif rule == "variance":
+        trigger = ev[cfg.COL_G].to_numpy(int) % 2
+    else:
+        trigger = (ev["mild"] >= events.matched_cut(ev["mild"], float((ev["var"] >= cfg.VAR_CUT).mean()))).to_numpy(int)
+    k = np.empty(n, int)
+    for a in range(n):
+        w = np.full(m, .15)
+        w[s[a]] += 1.0
+        w[lean[a]] += 0.6
+        if trigger[a]:
+            w[1 if m == 3 else 0] += 1.6
+        k[a] = rng.choice(m, p=w / w.sum())
+    ev[cfg.COL_K] = pd.array(k, dtype="Int64")
+    return ev
 
 
 def _selftest_one(verbose=True):
@@ -411,6 +635,29 @@ def _selftest_one(verbose=True):
     assert (cc["N"] == Nl).all()
     assert cc["perm_s"]["p_value"] < 0.05, cc["perm_s"]["p_value"]
     assert set(lean(cfg.COL_C)) <= set(range(cfg.N_CLASSES)) and len(lean(cfg.COL_C)) == n_c
+
+    # which summary captures the influence? two worlds, in which the truth is known
+    if cfg.N_CLASSES == 3:
+        res_ = {}
+        for rule in ("opposed", "variance", "mild"):
+            evg = _synthetic_groups(rule)
+            cmp_ = compare_summaries(evg, n_perm=60)
+            res_[rule] = cmp_
+            tb = cmp_["table"]
+            assert tb.loc["none", "logloss_bits"] > tb.loc["lean", "logloss_bits"] > 0
+            assert abs(tb.loc["none", "gain_vs_none"]) < 1e-12
+        a, b = res_["opposed"]["table"], res_["variance"]["table"]
+        assert a.loc["h", "logloss_bits"] < a.loc["g", "logloss_bits"], "h should win when opposed pairs drive k"
+        assert b.loc["g", "logloss_bits"] < b.loc["h", "logloss_bits"], "g should win when the variance drives k"
+        ad_a, ad_b = res_["opposed"]["added"], res_["variance"]["added"]
+        assert ad_a.iloc[2]["p_value"] < 0.05, "opposed pairs should add information beyond the variance"
+        assert ad_b.iloc[3]["p_value"] < 0.05, "the variance should add information beyond opposed pairs"
+        assert "better_than_ref" in a.columns and a.loc["g", "better_than_ref"] == 0.0
+        fa, fm = res_["opposed"]["family"], res_["mild"]["family"]
+        assert fa["logloss_bits"].iloc[0] < fa["logloss_bits"].iloc[-1], "w = 0 should beat w = 1 when only opposed pairs matter"
+        assert fm["logloss_bits"].iloc[-1] < fm["logloss_bits"].iloc[0], "w = 1 should beat w = 0 when mild pairs drive k"
+        assert res_["mild"]["added"].iloc[4]["p_value"] < 0.05, "mild pairs should add information beyond opposed pairs"
+        assert res_["opposed"]["added"].iloc[4]["p_value"] > 0.05, "mild pairs should add nothing when only opposed pairs matter"
 
     # slices: counts add up to the total and quarters cover the whole period
     sl = slice_tensors(ev, cfg.COL_L, B=20)
