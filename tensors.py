@@ -198,14 +198,53 @@ def summary(N, Ps, infl, P=None, tau=None):
                 row[f"p_{cfg.CLASS_LABELS[k]}"] = P[s, i, k]
             est = moves(P, s, i)
             for name, val in est.items():
+                val = float(val)
                 row[name] = val
                 if ci is None:
                     row[name + "_lo"] = row[name + "_hi"] = np.nan
                 else:
-                    lo, hi = moves(ci[0], s, i)[name], moves(ci[1], s, i)[name]
+                    lo, hi = float(moves(ci[0], s, i)[name]), float(moves(ci[1], s, i)[name])
                     row[name + "_lo"], row[name + "_hi"] = lo, hi
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+# =======================================================================================
+# R2: shift of the output distribution caused by the influencer (raw proportions, no shrinkage)
+# =======================================================================================
+def _shift_of(N):
+    """p(k | s, i) - p(k | s) for a count tensor or a stack of them (last three axes s, i, k)."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        P = N / N.sum(-1, keepdims=True)
+        q = N.sum(-2) / N.sum((-2, -1))[..., None]
+    return P - q[..., :, None, :]
+
+
+def shift_tensor(ev, infl, B=None, seed=None):
+    """How much does knowing the influencer move the output distribution, given the own class?
+    shift[s, i, k] = p(k | s, i) - p(k | s), raw proportions (tau = 0), so the values are what the data say.
+    The interval comes from the user-level bootstrap; the reference p(k | s) is recomputed in every replicate.
+    Returns a dict: shift, lo, hi (arrays s x i x k), sig (True where the interval excludes 0),
+    n (events per row s x i), p, q, and a long table."""
+    B, seed = cfg.B if B is None else B, cfg.SEED if seed is None else seed
+    m, n_i = cfg.N_CLASSES, n_influencer(infl)
+    d = usable(ev, infl)
+    code = _cells(d, infl)[3]
+    N = count(ev, infl)
+    S = _shift_of(N)
+    Nb = _boot_counts(d["user"].to_numpy(), code, m * n_i * m, B, seed).reshape(B, m, n_i, m)
+    lo, hi = _intervals(_shift_of(Nb))
+    n = N.sum(-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        P = N / n[..., None]
+        q = N.sum(1) / N.sum((1, 2))[:, None]
+    sig = (lo > 0) | (hi < 0)
+    labels = influencer_labels(infl)
+    rows = [{"s": cfg.CLASS_LABELS[s], infl: labels[i], "k": cfg.CLASS_LABELS[k], "n_row": int(n[s, i]),
+             "p": P[s, i, k], "baseline": q[s, k], "shift": S[s, i, k], "lo": lo[s, i, k], "hi": hi[s, i, k],
+             "excludes_0": bool(sig[s, i, k])}
+            for s in range(m) for i in range(n_i) for k in range(m)]
+    return {"shift": S, "lo": lo, "hi": hi, "sig": sig, "n": n, "p": P, "q": q, "table": pd.DataFrame(rows)}
 
 
 # =======================================================================================
@@ -487,6 +526,168 @@ def compare_summaries(ev, ref=None, n_perm=None, seed=None, tests=True):
 
 
 # =======================================================================================
+# Does the group add to the dyad? (R4)
+# =======================================================================================
+def group_beyond_dyad(ev, coord=None, n_perm=None, seed=None):
+    """Does the group's opinion tell more about the reply than the parent's opinion alone?
+    Uses the events that have BOTH the parent's class l and the group coordinate (g = mean x variance, or
+    h = mean x opposed pairs; default g), so every summary is scored on exactly the same replies.
+    table: held-out log-loss (bits per event, user folds, tau chosen inside the training folds) of
+           none (own class only), size (control), l (parent), coord (group), l+coord (parent and group);
+           better_than_ref is the gain over the parent-only summary l, with a user-bootstrap interval.
+    added: permutation tests with the shuffle inside the strata
+           coord | s, l, size : does the group add information once the parent is known?
+           l | s, coord, size : does the parent add information once the group is known?
+           cmi_excess = observed - mean of the null (bits per event)."""
+    coord = cfg.COL_G if coord is None else coord
+    seed = cfg.SEED if seed is None else seed
+    m, nb = cfg.N_CLASSES, len(cfg.TEST_SIZE_EDGES) + 1
+    need = [cfg.COL_S, cfg.COL_K, cfg.COL_L, coord, "n_members", "user"]
+    d = ev.dropna(subset=need).copy()
+    if len(d) == 0:
+        raise ValueError("no event has both the parent's class l and the group coordinate; build the events with events.py")
+    for c in need[:-1]:
+        d[c] = d[c].astype(int)
+    d["none"] = 0
+    d["size"] = _size_bin(d["n_members"])
+    joint = f"{cfg.COL_L}+{coord}"
+    d[joint] = d[cfg.COL_L] * cfg.N_G + d[coord]
+    _EXTRA.clear()
+    register_influencer("none", 1, ["no information"], [0])
+    register_influencer("size", nb, [f"size class {i}" for i in range(nb)], [0] * nb)
+    register_influencer(joint, m * cfg.N_G, [f"{a} | {b}" for a in cfg.CLASS_LABELS for b in influencer_labels(coord)],
+                        np.tile(np.arange(cfg.N_G) // 2, m))
+    names = ["none", "size", cfg.COL_L, coord, joint]
+    losses = {n: _heldout_loss(d, n, cfg.COMPARE_TAUS, cfg.COMPARE_FOLDS, seed) for n in names}
+    rows = []
+    for n in names:
+        mean, lo, hi = _paired(losses[cfg.COL_L][0] - losses[n][0], d["user"].to_numpy(), cfg.COMPARE_B, seed)
+        rows.append({"summary": n, "categories": n_influencer(n), "logloss_bits": losses[n][0].mean(),
+                     "gain_vs_none": losses["none"][0].mean() - losses[n][0].mean(),
+                     "median_tau": float(np.median(losses[n][1])),
+                     "better_than_ref": mean, "ref_lo": lo, "ref_hi": hi})
+    table = pd.DataFrame(rows).set_index("summary")
+    rows = []
+    for label, col, strata in ((f"{coord} | s, l, size", coord, (cfg.COL_S, cfg.COL_L, "size")),
+                               (f"l | s, {coord}, size", cfg.COL_L, (cfg.COL_S, coord, "size"))):
+        r = permutation_test(d, col, strata, n_perm, seed)
+        rows.append({"coordinate | held fixed": label, "cmi_bits": r["cmi"], "null_mean": float(r["null"].mean()),
+                     "cmi_excess": r["cmi_excess"], "p_value": r["p_value"]})
+    return {"table": table, "added": pd.DataFrame(rows).set_index("coordinate | held fixed"),
+            "n_events": len(d), "n_users": d["user"].nunique(), "coord": coord, "ref": cfg.COL_L}
+
+
+# =======================================================================================
+# How much of the new opinion is predictable, and from what? (R5)
+# =======================================================================================
+def _entropy_mm(N, axes):
+    """Entropy (bits) of the marginal of the count array N over `axes`, with the Miller-Madow bias correction
+    (observed cells - 1) / (2 n ln 2). axes = () is the empty variable, with entropy 0."""
+    if len(axes) == 0:
+        return 0.0
+    drop = tuple(a for a in range(N.ndim) if a not in axes)
+    c = (N.sum(axis=drop) if drop else N).ravel().astype(float)
+    n = c.sum()
+    if n <= 0:
+        return np.nan
+    c = c[c > 0]
+    p = c / n
+    return float(-(p * np.log2(p)).sum() + (len(c) - 1) / (2 * n * np.log(2)))
+
+
+def _increments(N):
+    """N has axes (v_1, ..., v_r, k). Returns H(K) and I(K; v_j | v_1..v_{j-1}) for j = 1..r (bits).
+    The increments add up to I(K; v_1..v_r) exactly (chain rule), all with the same bias correction."""
+    r, kax = N.ndim - 1, N.ndim - 1
+    H = lambda axes: _entropy_mm(N, tuple(axes))
+    out = []
+    for j in range(1, r + 1):
+        prev, upto = tuple(range(j - 1)), tuple(range(j))
+        out.append(H(prev + (kax,)) + H(upto) - H(prev) - H(upto + (kax,)))
+    return H((kax,)), np.array(out)
+
+
+def _shuffle_within(v, strata_code, rng):
+    base = np.argsort(strata_code, kind="stable")
+    order = np.lexsort((rng.random(len(v)), strata_code))
+    out = np.empty_like(v)
+    out[base] = v[order]
+    return out
+
+
+def information_decomposition(ev, chain=None, B=None, n_perm=None, seed=None, size_strata=True):
+    """Chain rule for the information the reply's class k receives:
+        I(K; S, L, G) = I(K; S)  +  I(K; L | S)  +  I(K; G | S, L)
+        own opinion (persistence), + the parent beyond it, + the group beyond both.
+    chain = columns in order, default (s, l, g) ; use (s, l) for the dyadic table (the larger sample).
+    All terms are in bits per event with the Miller-Madow bias correction; `share_of_HK` divides by H(K).
+    lo / hi: user-bootstrap percentiles (cfg.CI), centred on the estimate because the bootstrap of an information
+    term is itself slightly biased; for terms close to 0 trust the permutation excess more than the interval. For the conditional terms the influencer is also shuffled among
+    events with the same earlier variables (and the same group-size class if size_strata): null_mean is the
+    mean of that null, excess = estimate - null_mean, p_value its permutation p-value.
+    Returns a DataFrame with rows H(K), the terms, and their sum I(K; all)."""
+    chain = [cfg.COL_S, cfg.COL_L, cfg.COL_G] if chain is None else list(chain)
+    B = cfg.B if B is None else B
+    n_perm = cfg.N_PERM if n_perm is None else n_perm
+    seed = cfg.SEED if seed is None else seed
+    need = chain + [cfg.COL_K, "user"]
+    d = ev.dropna(subset=need).copy()
+    if len(d) == 0:
+        raise ValueError(f"no event has all of {need}")
+    sizes = [cfg.N_CLASSES if c in (cfg.COL_S, cfg.COL_L, cfg.COL_K) else n_influencer(c) for c in chain]
+    sizes_all = sizes + [cfg.N_CLASSES]
+    X = np.column_stack([d[c].to_numpy(dtype=int) for c in chain + [cfg.COL_K]])
+    use_size = size_strata and "n_members" in d and d["n_members"].notna().all() and d["n_members"].nunique() > 1
+    size = _size_bin(d["n_members"].to_numpy(dtype=int)) if use_size else np.zeros(len(d), int)
+
+    def counts(X_, weights=None):
+        code = np.ravel_multi_index(tuple(X_.T), sizes_all)
+        return np.bincount(code, weights=weights, minlength=int(np.prod(sizes_all))).reshape(sizes_all)
+
+    N = counts(X)
+    h_k, inc = _increments(N)
+    r = len(chain)
+
+    # user bootstrap: resample users, rebuild the count array from the user x cell matrix
+    code = np.ravel_multi_index(tuple(X.T), sizes_all)
+    users = pd.factorize(d["user"])[0]
+    ncell = int(np.prod(sizes_all))
+    A = np.zeros((users.max() + 1, ncell))
+    np.add.at(A, (users, code), 1.0)
+    rng = np.random.default_rng(seed)
+    nu = A.shape[0]
+    boots = np.empty((B, r + 2))
+    for b in range(B):
+        w = np.bincount(rng.integers(0, nu, nu), minlength=nu)
+        Nb = (w @ A).reshape(sizes_all)
+        hk_b, inc_b = _increments(Nb)
+        boots[b] = [hk_b, *inc_b, inc_b.sum()]
+    est0 = np.array([h_k, *inc, inc.sum()])
+    lo, hi = np.percentile(boots - boots.mean(axis=0) + est0, cfg.CI, axis=0)   # centred: the bootstrap of an information term is biased
+
+    # permutation null of the conditional terms
+    null_mean, pval = np.full(r, np.nan), np.full(r, np.nan)
+    for j in range(1, r):
+        strata = np.column_stack([X[:, :j], size]) if use_size else X[:, :j]
+        strata_code = pd.DataFrame(strata).groupby(list(range(strata.shape[1])), sort=False).ngroup().to_numpy()
+        obs, null = inc[j], np.empty(n_perm)
+        for p in range(n_perm):
+            Xp = X.copy()
+            Xp[:, j] = _shuffle_within(X[:, j], strata_code, rng)
+            null[p] = _increments(counts(Xp))[1][j]
+        null_mean[j], pval[j] = null.mean(), (1 + int((null >= obs).sum())) / (n_perm + 1)
+
+    names = ["H(K)"] + [("I(K;" + c.upper() + ")" if j == 0 else f"I(K;{c.upper()} | {','.join(x.upper() for x in chain[:j])})")
+                       for j, c in enumerate(chain)] + [f"I(K; {','.join(c.upper() for c in chain)})"]
+    est = np.array([h_k, *inc, inc.sum()])
+    out = pd.DataFrame({"bits": est, "lo": lo, "hi": hi, "share_of_HK": est / h_k,
+                        "null_mean": [np.nan, *null_mean, np.nan], "excess": [np.nan, *(inc - null_mean), np.nan],
+                        "p_value": [np.nan, *pval, np.nan]}, index=names)
+    out.attrs.update(n_events=len(d), n_users=int(users.max() + 1), chain=chain, size_strata=bool(use_size))
+    return out
+
+
+# =======================================================================================
 # Everything for one tensor
 # =======================================================================================
 def fit_tensor(ev, infl, B=None, n_perm=None, tau=None, seed=None):
@@ -582,6 +783,44 @@ def _synthetic_groups(rule, n=40000, n_users=800, seed=11):
     return ev
 
 
+def _synthetic_chain(rule, n=40000, n_users=800, seed=21):
+    """Events with s, l, g, k whose truth is known:
+        rule = 'dyad'  : k depends on s and l only (g is correlated with l but adds nothing)
+        rule = 'group' : k depends on s, l and, in addition, on the dispersion bit of g
+    Returns (events, P_true[s, l, k] for the dyad rule, or None)."""
+    rng = np.random.default_rng(seed)
+    m = cfg.N_CLASSES
+    s, l = rng.integers(0, m, n), rng.integers(0, m, n)
+    bit = rng.integers(0, 2, n)
+    g = 2 * l + bit                                                # mean level = l, dispersion bit random
+    P = np.empty((m, m, m))
+    for a in range(m):
+        for b in range(m):
+            w = np.full(m, .15)
+            w[a] += 1.0
+            w[b] += 0.7
+            P[a, b] = w / w.sum()
+    k = np.empty(n, int)
+    for i in range(n):
+        p = P[s[i], l[i]].copy()
+        if rule == "group" and bit[i]:
+            p[1 if m == 3 else 0] += 0.5
+            p /= p.sum()
+        k[i] = rng.choice(m, p=p)
+    ev = pd.DataFrame({"user": rng.integers(0, n_users, n), "thread": rng.integers(0, 4000, n),
+                       cfg.COL_S: s, cfg.COL_L: l, cfg.COL_G: g, cfg.COL_K: k,
+                       "n_members": rng.choice([2, 3, 4, 5, 6, 8], n)})
+    for c in (cfg.COL_S, cfg.COL_L, cfg.COL_G, cfg.COL_K, "n_members"):
+        ev[c] = ev[c].astype("Int64")
+    return ev, P
+
+
+def _true_cmi_ls(P, m):
+    """I(K; L | S) in bits for uniform s and l with the tensor P[s, l, k]."""
+    q = P.mean(axis=1)                                             # p(k | s)
+    return float((P * np.log2(P / q[:, None, :])).sum() / (m * m))
+
+
 def _selftest_one(verbose=True):
     ev, P_true = _synthetic_events()
 
@@ -658,6 +897,52 @@ def _selftest_one(verbose=True):
         assert fm["logloss_bits"].iloc[-1] < fm["logloss_bits"].iloc[0], "w = 1 should beat w = 0 when mild pairs drive k"
         assert res_["mild"]["added"].iloc[4]["p_value"] < 0.05, "mild pairs should add information beyond opposed pairs"
         assert res_["opposed"]["added"].iloc[4]["p_value"] > 0.05, "mild pairs should add nothing when only opposed pairs matter"
+
+    # R4 and R5: does the group add to the dyad, and how is the information split? Two worlds with known truth
+    ev_d, P_d = _synthetic_chain("dyad")
+    ev_g, _ = _synthetic_chain("group")
+    dec_d = information_decomposition(ev_d, B=100, n_perm=60)
+    dec_g = information_decomposition(ev_g, B=100, n_perm=60)
+    N4 = np.zeros((cfg.N_CLASSES, cfg.N_CLASSES, cfg.N_G, cfg.N_CLASSES))
+    for a, b, c, k_ in zip(ev_d[cfg.COL_S], ev_d[cfg.COL_L], ev_d[cfg.COL_G], ev_d[cfg.COL_K]):
+        N4[a, b, c, k_] += 1
+    h_k, inc = _increments(N4)
+    direct = _entropy_mm(N4, (3,)) + _entropy_mm(N4, (0, 1, 2)) - _entropy_mm(N4, (0, 1, 2, 3))
+    assert np.isclose(inc.sum(), direct), "the chain rule must add up exactly"
+    assert np.isclose(dec_d.loc["H(K)", "bits"], h_k) and np.isclose(dec_d.iloc[-1]["bits"], inc.sum())
+    assert (dec_d["lo"] <= dec_d["bits"] + 1e-9).all() and (dec_d["bits"] <= dec_d["hi"] + 1e-9).all()
+    true_ls = _true_cmi_ls(P_d, cfg.N_CLASSES)
+    assert abs(dec_d.iloc[2]["bits"] - true_ls) < 0.012, (dec_d.iloc[2]["bits"], true_ls)
+    assert dec_d.iloc[2]["p_value"] < 0.05 and dec_d.iloc[3]["p_value"] > 0.05, "dyad world: the group must add nothing"
+    assert dec_g.iloc[3]["p_value"] < 0.05 and dec_g.iloc[3]["excess"] > 0.005, "group world: the group must add information"
+    dec_dy = information_decomposition(ev_d, chain=[cfg.COL_S, cfg.COL_L], B=50, n_perm=30)
+    assert len(dec_dy) == 4 and dec_dy.iloc[2]["p_value"] < 0.05
+    bd_d, bd_g = group_beyond_dyad(ev_d, n_perm=60), group_beyond_dyad(ev_g, n_perm=60)
+    assert bd_g["table"].loc["l+g", "better_than_ref"] > 0 and bd_g["table"].loc["l+g", "ref_lo"] > 0, "group world: l+g beats l"
+    assert bd_d["table"].loc["l+g", "ref_lo"] <= 0.002, "dyad world: l+g must not clearly beat l"
+    assert bd_g["added"].iloc[0]["p_value"] < 0.05 and bd_d["added"].iloc[0]["p_value"] > 0.05
+    assert bd_d["added"].iloc[1]["p_value"] > 0.05, "here g contains l (mean level = l), so l adds nothing beyond g"
+    # the bias correction works: with no dependence at all, the corrected term is closer to 0 than the plug-in term
+    rng_ = np.random.default_rng(0)
+    mm = []
+    for _ in range(40):
+        Xn = np.zeros((cfg.N_CLASSES, cfg.N_CLASSES, cfg.N_G, cfg.N_CLASSES))
+        np.add.at(Xn, (rng_.integers(0, cfg.N_CLASSES, 1500), rng_.integers(0, cfg.N_CLASSES, 1500),
+                       rng_.integers(0, cfg.N_G, 1500), rng_.integers(0, cfg.N_CLASSES, 1500)), 1)
+        mm.append(_increments(Xn)[1][2])
+    assert abs(np.mean(mm)) < 0.01, f"corrected I(K;G|S,L) should be about 0 without dependence, got {np.mean(mm):.4f}"
+
+    # R2 shifts: the weighted shift sums to zero for every (s, k); dependence pushes toward the parent
+    sh = shift_tensor(ev, cfg.COL_L, B=80)
+    assert np.allclose((sh["shift"] * sh["n"][..., None]).sum(1), 0, atol=1e-6)
+    assert np.allclose(sh["shift"], sh["p"] - sh["q"][:, None, :])
+    for s_ in range(cfg.N_CLASSES):
+        for l_ in range(cfg.N_CLASSES):
+            if s_ != l_:
+                assert sh["lo"][s_, l_, l_] > 0, "dependent data: the parent's class must become more likely"
+    ev_i, _ = _synthetic_events(dependent=False, seed=5)
+    sh_i = shift_tensor(ev_i, cfg.COL_L, B=80)
+    assert sh_i["sig"].mean() < 0.25, "independent data: intervals should mostly contain 0"
 
     # slices: counts add up to the total and quarters cover the whole period
     sl = slice_tensors(ev, cfg.COL_L, B=20)

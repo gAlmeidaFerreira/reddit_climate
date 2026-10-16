@@ -4,10 +4,12 @@ Events table: one row per reply that can be used to estimate a transition (Stage
     raw CSVs -> items -> replies (+ parent) -> own opinion s -> group statistics -> events
 
 Three tables come out, with the same columns (cfg.EVENT_COLS):
-    dyadic  events: influencer l (class of the parent's score), g and c are empty
-    group   events: influencer g (2*m categories from mean and variance of raw scores), l and c are empty
-    comp    events: influencer c (composition of the group: class counts, or rounded shares) AND g,
-            so the two summaries can be compared on exactly the same replies
+    dyadic  events: influencer l (class of the parent's score), g, h and c are empty
+    group   events: influencer g (mean x variance) and h (mean x opposed pairs); l (class of the parent's score)
+            is filled when the parent is scored and written by someone else, so that group and dyad
+            can be compared on the same replies; c is empty
+    comp    events: influencer c (composition of the group: class counts, or rounded shares) AND g, h and l,
+            so the summaries can be compared on exactly the same replies
 The number of classes m (2 or 3) is cfg.N_CLASSES; change it with cfg.set_classes(m) before building.
 
 Rules that protect against leakage:
@@ -409,9 +411,15 @@ def opp_cut_for(d):
 
 
 def _group_cols(d, opp_cut):
-    """Columns shared by the group and composition events: g (mean x variance), h (mean x opposed pairs), lean."""
+    """Columns shared by the group and composition events: g (mean x variance), h (mean x opposed pairs), lean,
+    and l (the parent's class, same rule as in the dyadic events: scored parent written by someone else)."""
     lean = to_class(d["g_mu"], cfg.MEAN_CUTS)
-    return {cfg.COL_G: 2 * lean + (d["g_var"] >= cfg.VAR_CUT).astype(float),
+    if "x_parent" in d and "parent_user" in d and "user" in d:
+        parent_ok = (d["x_parent"].notna() & (d["parent_user"] != d["user"])).to_numpy()
+        l_cls = np.where(parent_ok, to_class(d["x_parent"], cfg.CUTS), np.nan)
+    else:                                                          # tables without parents (synthetic tests)
+        l_cls = np.full(len(d), np.nan)
+    return {cfg.COL_L: l_cls, cfg.COL_G: 2 * lean + (d["g_var"] >= cfg.VAR_CUT).astype(float),
             cfg.COL_H: 2 * lean + (d["g_opp"] >= opp_cut).astype(float),
             cfg.COL_LEAN: lean, "opp": d["g_opp"], "mild": d["g_mild"], "n_members": d["g_n"], "mu": d["g_mu"], "var": d["g_var"]}
 
@@ -728,6 +736,13 @@ def _selftest_one(verbose=True):
         assert set(cfg.EVENT_COLS) == set(res[name].columns)
     assert res["group"][cfg.COL_G].dropna().between(0, cfg.N_G - 1).all()
     assert res["dyadic"][cfg.COL_L].dropna().between(0, cfg.N_CLASSES - 1).all()
+    # l in the group and composition events is the dyadic l, and exists exactly where the dyadic event exists
+    for name in ("group", "comp"):
+        gl = res[name][cfg.COL_L].dropna()
+        assert gl.index.isin(res["dyadic"].index).all(), "a group event with l must also be a dyadic event"
+        assert (res["dyadic"].loc[gl.index, cfg.COL_L] == gl).all(), "l differs between the dyadic and the group table"
+        both = res[name].index.intersection(res["dyadic"].index)
+        assert res[name].loc[both, cfg.COL_L].notna().all(), "a dyadic event inside the group table lost its l"
     old = (cfg.AUTHORS_ONCE, cfg.M_MAX)
     try:
         cfg.AUTHORS_ONCE, cfg.M_MAX = True, 3
